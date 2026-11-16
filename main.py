@@ -814,6 +814,9 @@ class MainWindow(QMainWindow):
         self.input.clear()
         self.send_button.setEnabled(False)
         self.input.setEnabled(False)
+        self.character_list.setEnabled(False)
+        self.edit_button.setEnabled(False)
+        self.more_button.setEnabled(False)
         self.messages.append({"role": "user", "content": text})
         self.append_message("user", text)
         self.store.save_chat(self.current_character_id, self.messages)
@@ -857,13 +860,18 @@ class MainWindow(QMainWindow):
         self.current_bubble = None
         self.send_button.setEnabled(True)
         self.input.setEnabled(True)
+        self.character_list.setEnabled(True)
+        self.edit_button.setEnabled(True)
+        self.more_button.setEnabled(True)
         self.input.setFocus()
         self.worker = None
 
     def closeEvent(self, event) -> None:
         if self.worker and self.worker.isRunning():
             self.worker.requestInterruption()
-            self.worker.wait(1500)
+            if not self.worker.wait(2500):
+                self.worker.terminate()
+                self.worker.wait(500)
         event.accept()
 
 
