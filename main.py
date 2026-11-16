@@ -6,11 +6,12 @@ import shutil
 import subprocess
 import sys
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any
 
 import requests
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QProcess, QSize
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QProcess, QProcessEnvironment, QSize
 from PySide6.QtGui import QPixmap, QFont, QKeySequence, QShortcut, QDesktopServices
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
@@ -199,6 +200,87 @@ class ChatWorker(QThread):
             self.failed.emit("Модель отвечает слишком долго. Подожди немного и попробуй ещё раз.")
         except requests.RequestException as exc:
             self.failed.emit(f"Ошибка соединения: {exc}")
+
+
+class RuntimeDownloadWorker(QThread):
+    progress = Signal(str, int)
+    completed = Signal(str)
+    failed = Signal(str)
+
+    RELEASE_API = "https://api.github.com/repos/ollama/ollama/releases/latest"
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def run(self) -> None:
+        runtime_dir = app_data_dir() / "runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = runtime_dir / "ollama-windows-amd64.zip"
+        partial_path = runtime_dir / "ollama-windows-amd64.zip.part"
+        try:
+            self.progress.emit("Получаем официальный выпуск Ollama…", 0)
+            release = requests.get(
+                self.RELEASE_API,
+                headers={"Accept": "application/vnd.github+json", "User-Agent": APP_NAME},
+                timeout=(15, 45)
+            )
+            release.raise_for_status()
+            assets = release.json().get("assets", [])
+            asset = next((a for a in assets if a.get("name") == "ollama-windows-amd64.zip"), None)
+            if not asset or not asset.get("browser_download_url"):
+                raise RuntimeError("В последнем выпуске Ollama не найден архив для Windows x64.")
+
+            self.progress.emit(f"Скачиваем движок Ollama {release.json().get('tag_name', '')}…", 0)
+            with requests.get(asset["browser_download_url"], stream=True, timeout=(30, 120)) as response:
+                response.raise_for_status()
+                total = int(response.headers.get("content-length") or asset.get("size") or 0)
+                free = shutil.disk_usage(runtime_dir).free
+                if total and free < total * 2:
+                    raise RuntimeError(
+                        f"Недостаточно свободного места. Для распаковки движка нужно примерно "
+                        f"{total * 2 / (1024 ** 3):.1f} ГБ свободного места."
+                    )
+                downloaded = 0
+                with partial_path.open("wb") as output:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if self.isInterruptionRequested():
+                            raise InterruptedError("Загрузка отменена.")
+                        if not chunk:
+                            continue
+                        output.write(chunk)
+                        downloaded += len(chunk)
+                        percent = int(downloaded * 100 / total) if total else 0
+                        mb = downloaded / (1024 * 1024)
+                        if total:
+                            total_mb = total / (1024 * 1024)
+                            label = f"Движок Ollama: {mb:.0f} / {total_mb:.0f} МБ"
+                        else:
+                            label = f"Движок Ollama: скачано {mb:.0f} МБ"
+                        self.progress.emit(label, min(99, percent))
+
+            partial_path.replace(archive_path)
+            self.progress.emit("Распаковываем локальный движок…", 100)
+            with zipfile.ZipFile(archive_path, "r") as archive:
+                root = runtime_dir.resolve()
+                for info in archive.infolist():
+                    if self.isInterruptionRequested():
+                        raise InterruptedError("Распаковка отменена.")
+                    target = (runtime_dir / info.filename).resolve()
+                    if os.path.commonpath((str(root), str(target))) != str(root):
+                        raise RuntimeError("Архив содержит недопустимый путь.")
+                    archive.extract(info, runtime_dir)
+
+            executable = next(runtime_dir.rglob("ollama.exe"), None)
+            if not executable:
+                raise RuntimeError("В архиве не найден ollama.exe.")
+            archive_path.unlink(missing_ok=True)
+            self.completed.emit(str(executable))
+        except InterruptedError as exc:
+            partial_path.unlink(missing_ok=True)
+            self.failed.emit(str(exc))
+        except (requests.RequestException, OSError, zipfile.BadZipFile, RuntimeError, ValueError) as exc:
+            partial_path.unlink(missing_ok=True)
+            self.failed.emit(f"Не удалось подготовить Ollama: {exc}")
 
 
 class CharacterDialog(QDialog):
@@ -404,6 +486,11 @@ class MainWindow(QMainWindow):
         self.messages: list[dict[str, str]] = []
         self.worker: ChatWorker | None = None
         self.pull_process: QProcess | None = None
+        self.runtime_worker: RuntimeDownloadWorker | None = None
+        self.ollama_process: QProcess | None = None
+        self.ollama_executable: str | None = None
+        self._pull_after_runtime = False
+        self._server_wait_attempts = 0
         self.current_bubble: MessageBubble | None = None
         self.models_installed: list[str] = []
         self.setWindowTitle("AkiraMakira")
@@ -461,7 +548,8 @@ class MainWindow(QMainWindow):
         self.connection_label = QLabel("Проверка Ollama…")
         self.connection_label.setObjectName("muted")
         mp.addWidget(self.connection_label)
-        self.pull_button = QPushButton("↓  Скачать выбранную модель")
+        self.pull_button = QPushButton("↓  Подготовить ИИ")
+        self.pull_button.setToolTip("Скачает portable-движок Ollama и выбранную модель. Установка Ollama в Windows не нужна.")
         self.pull_button.clicked.connect(self.pull_selected_model)
         mp.addWidget(self.pull_button)
         self.pull_progress = QProgressBar()
@@ -718,6 +806,10 @@ class MainWindow(QMainWindow):
         self.store.save_chat(self.current_character_id, self.messages)
         self.render_messages()
 
+    def embedded_ollama_path(self) -> Path:
+        runtime = app_data_dir() / "runtime"
+        return next(runtime.rglob("ollama.exe"), runtime / "ollama.exe") if runtime.exists() else runtime / "ollama.exe"
+
     def refresh_models(self) -> None:
         current = self.model_combo.currentText() or MODEL_CHOICES[0]
         try:
@@ -725,8 +817,9 @@ class MainWindow(QMainWindow):
             response.raise_for_status()
             data = response.json()
             self.models_installed = [m.get("name", "") for m in data.get("models", []) if m.get("name")]
-            self.connection_label.setText("● Ollama подключена")
+            self.connection_label.setText("● Локальный ИИ готов")
             self.connection_label.setStyleSheet("color:#79d9b2;")
+            self.pull_button.setText("↓  Скачать выбранную модель")
             self.model_combo.blockSignals(True)
             self.model_combo.clear()
             choices = list(dict.fromkeys(MODEL_CHOICES + self.models_installed))
@@ -737,7 +830,7 @@ class MainWindow(QMainWindow):
             self.model_combo.blockSignals(False)
         except (requests.RequestException, ValueError):
             self.models_installed = []
-            self.connection_label.setText("○ Ollama не найдена")
+            self.connection_label.setText("○ Локальный движок не запущен")
             self.connection_label.setStyleSheet("color:#e6a0a8;")
 
     def check_ollama(self) -> None:
@@ -745,38 +838,158 @@ class MainWindow(QMainWindow):
             response = requests.get(f"{OLLAMA_URL}/api/version", timeout=2)
             response.raise_for_status()
             version = response.json().get("version", "")
-            self.connection_label.setText(f"● Ollama подключена {version}".strip())
+            self.connection_label.setText(f"● Локальный ИИ готов {version}".strip())
             self.connection_label.setStyleSheet("color:#79d9b2;")
             self.refresh_models()
+            return
         except (requests.RequestException, ValueError):
-            self.connection_label.setText("○ Запусти Ollama")
+            pass
+
+        embedded = self.embedded_ollama_path()
+        if embedded.exists():
+            self.ollama_executable = str(embedded)
+            self.connection_label.setText("Запускаем встроенный движок Ollama…")
+            self.connection_label.setStyleSheet("color:#e6c782;")
+            self.start_embedded_server()
+        else:
+            self.connection_label.setText("Нажми «Подготовить ИИ» — Ollama установится в папку приложения.")
+            self.connection_label.setStyleSheet("color:#c1b2d8;")
+            self.pull_button.setText("↓  Подготовить ИИ")
+
+    def start_embedded_server(self) -> None:
+        if not self.ollama_executable or not Path(self.ollama_executable).exists():
+            self.connection_label.setText("Встроенный движок не найден.")
+            return
+        try:
+            if self.ollama_process and self.ollama_process.state() != QProcess.ProcessState.NotRunning:
+                return
+            env = QProcessEnvironment.systemEnvironment()
+            env.insert("OLLAMA_HOST", "127.0.0.1:11434")
+            env.insert("OLLAMA_MODELS", str(app_data_dir() / "models"))
+            env.insert("OLLAMA_NOHISTORY", "1")
+            process = QProcess(self)
+            process.setProcessEnvironment(env)
+            process.setWorkingDirectory(str(Path(self.ollama_executable).parent))
+            process.setProgram(self.ollama_executable)
+            process.setArguments(["serve"])
+            process.errorOccurred.connect(self.on_ollama_process_error)
+            process.start()
+            self.ollama_process = process
+            self._server_wait_attempts = 0
+            QTimer.singleShot(800, self.poll_embedded_server)
+        except Exception as exc:
+            self.connection_label.setText(f"Не удалось запустить движок: {exc}")
+
+    def on_ollama_process_error(self, error) -> None:
+        if self.ollama_process and self.ollama_process.state() == QProcess.ProcessState.NotRunning:
+            self.connection_label.setText("Не удалось запустить встроенный Ollama.")
             self.connection_label.setStyleSheet("color:#e6a0a8;")
+
+    def poll_embedded_server(self) -> None:
+        try:
+            response = requests.get(f"{OLLAMA_URL}/api/version", timeout=1)
+            response.raise_for_status()
+            self.connection_label.setText("● Встроенный движок Ollama готов")
+            self.connection_label.setStyleSheet("color:#79d9b2;")
+            self.refresh_models()
+            if self._pull_after_runtime:
+                self._pull_after_runtime = False
+                QTimer.singleShot(300, self.pull_selected_model)
+            return
+        except requests.RequestException:
+            self._server_wait_attempts += 1
+            if self._server_wait_attempts < 45:
+                QTimer.singleShot(1000, self.poll_embedded_server)
+            else:
+                self.connection_label.setText("Ollama не запустилась. Перезапусти приложение.")
+                self.connection_label.setStyleSheet("color:#e6a0a8;")
+
+    def begin_runtime_download(self) -> None:
+        if self.runtime_worker and self.runtime_worker.isRunning():
+            return
+        runtime_dir = app_data_dir() / "runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        free_gb = shutil.disk_usage(runtime_dir).free / (1024 ** 3)
+        if free_gb < 4:
+            QMessageBox.warning(
+                self, "Мало места на диске",
+                f"Для подготовки локального движка нужно больше свободного места. Сейчас свободно {free_gb:.1f} ГБ."
+            )
+            return
+        self.pull_button.setEnabled(False)
+        self.pull_button.setText("Подготавливаем движок…")
+        self.pull_progress.setRange(0, 100)
+        self.pull_progress.setValue(0)
+        self.pull_progress.show()
+        self.runtime_worker = RuntimeDownloadWorker()
+        self.runtime_worker.progress.connect(self.on_runtime_progress)
+        self.runtime_worker.completed.connect(self.on_runtime_downloaded)
+        self.runtime_worker.failed.connect(self.on_runtime_failed)
+        self.runtime_worker.finished.connect(self.on_runtime_thread_finished)
+        self.runtime_worker.start()
+
+    def on_runtime_progress(self, label: str, percent: int) -> None:
+        self.connection_label.setText(label)
+        if percent >= 0:
+            self.pull_progress.setRange(0, 100)
+            self.pull_progress.setValue(percent)
+
+    def on_runtime_downloaded(self, executable: str) -> None:
+        self.ollama_executable = executable
+        self.pull_progress.hide()
+        self.pull_button.setEnabled(True)
+        self.pull_button.setText("↓  Скачать выбранную модель")
+        self.connection_label.setText("Движок подготовлен. Запускаем…")
+        self._pull_after_runtime = True
+        self.start_embedded_server()
+
+    def on_runtime_failed(self, error: str) -> None:
+        self.pull_progress.hide()
+        self.pull_button.setEnabled(True)
+        self.pull_button.setText("↓  Подготовить ИИ")
+        self.connection_label.setText("Движок не подготовлен")
+        QMessageBox.warning(self, "Не удалось подготовить ИИ", error)
+
+    def on_runtime_thread_finished(self) -> None:
+        self.runtime_worker = None
 
     def pull_selected_model(self) -> None:
         model = self.model_combo.currentText().strip()
         if not model:
             return
         if model in self.models_installed:
-            QMessageBox.information(self, "Модель уже установлена", f"{model} уже доступна в Ollama.")
+            QMessageBox.information(self, "Модель уже установлена", f"{model} уже доступна локально.")
             return
-        executable = shutil.which("ollama")
-        if not executable:
-            local = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe"
-            if local.exists():
-                executable = str(local)
-        if not executable:
-            answer = QMessageBox.question(
-                self, "Нужна Ollama",
-                "Ollama не найдена. Открыть официальный сайт, чтобы установить её?"
-            )
-            if answer == QMessageBox.StandardButton.Yes:
-                QDesktopServices.openUrl(QUrl("https://ollama.com/download/windows"))
+
+        try:
+            requests.get(f"{OLLAMA_URL}/api/version", timeout=1).raise_for_status()
+        except requests.RequestException:
+            embedded = self.embedded_ollama_path()
+            if embedded.exists():
+                self.ollama_executable = str(embedded)
+                self._pull_after_runtime = True
+                self.start_embedded_server()
+            else:
+                self.begin_runtime_download()
             return
+
+        if not self.ollama_executable:
+            self.ollama_executable = shutil.which("ollama")
+        if not self.ollama_executable or not Path(self.ollama_executable).exists():
+            embedded = self.embedded_ollama_path()
+            if embedded.exists():
+                self.ollama_executable = str(embedded)
+            else:
+                QMessageBox.warning(self, "Движок недоступен", "Нажми «Подготовить ИИ», чтобы приложение само скачало portable-версию Ollama.")
+                return
+
         self.pull_button.setEnabled(False)
         self.pull_button.setText("Загрузка модели…")
+        self.pull_progress.setRange(0, 0)
         self.pull_progress.show()
         self.pull_process = QProcess(self)
-        self.pull_process.setProgram(executable)
+        self.pull_process.setWorkingDirectory(str(Path(self.ollama_executable).parent))
+        self.pull_process.setProgram(self.ollama_executable)
         self.pull_process.setArguments(["pull", model])
         self.pull_process.readyReadStandardOutput.connect(self.read_pull_output)
         self.pull_process.readyReadStandardError.connect(self.read_pull_output)
@@ -815,7 +1028,7 @@ class MainWindow(QMainWindow):
         try:
             requests.get(f"{OLLAMA_URL}/api/version", timeout=2).raise_for_status()
         except requests.RequestException:
-            QMessageBox.warning(self, "Ollama не запущена", "Запусти приложение Ollama и повтори отправку.")
+            QMessageBox.warning(self, "Локальный ИИ не запущен", "Нажми «Подготовить ИИ», чтобы приложение само запустило движок.")
             return
 
         self.input.clear()
@@ -887,6 +1100,14 @@ class MainWindow(QMainWindow):
             if not self.worker.wait(2500):
                 self.worker.terminate()
                 self.worker.wait(500)
+        if self.runtime_worker and self.runtime_worker.isRunning():
+            self.runtime_worker.requestInterruption()
+            self.runtime_worker.wait(3000)
+        if self.ollama_process and self.ollama_process.state() != QProcess.ProcessState.NotRunning:
+            self.ollama_process.terminate()
+            if not self.ollama_process.waitForFinished(1800):
+                self.ollama_process.kill()
+                self.ollama_process.waitForFinished(800)
         event.accept()
 
 
