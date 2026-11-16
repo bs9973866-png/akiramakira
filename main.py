@@ -485,10 +485,10 @@ class MainWindow(QMainWindow):
         self.character_list = QListWidget()
         self.character_list.currentItemChanged.connect(self.on_character_changed)
         side.addWidget(self.character_list, 1)
-        new_button = QPushButton("＋  Создать персонажа")
-        new_button.setObjectName("primary")
-        new_button.clicked.connect(self.create_character)
-        side.addWidget(new_button)
+        self.new_character_button = QPushButton("＋  Создать персонажа")
+        self.new_character_button.setObjectName("primary")
+        self.new_character_button.clicked.connect(self.create_character)
+        side.addWidget(self.new_character_button)
 
         outer.addWidget(sidebar)
 
@@ -825,6 +825,7 @@ class MainWindow(QMainWindow):
         self.edit_button.setEnabled(False)
         self.more_button.setEnabled(False)
         self.clear_chat_button.setEnabled(False)
+        self.new_character_button.setEnabled(False)
         self.messages.append({"role": "user", "content": text})
         self.append_message("user", text)
         self.store.save_chat(self.current_character_id, self.messages)
@@ -873,6 +874,7 @@ class MainWindow(QMainWindow):
         self.edit_button.setEnabled(True)
         self.more_button.setEnabled(True)
         self.clear_chat_button.setEnabled(True)
+        self.new_character_button.setEnabled(True)
         self.input.setFocus()
 
     def on_worker_thread_finished(self) -> None:
