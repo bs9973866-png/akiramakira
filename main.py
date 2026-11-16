@@ -829,6 +829,7 @@ class MainWindow(QMainWindow):
         self.worker.token.connect(self.on_token)
         self.worker.completed.connect(self.on_chat_completed)
         self.worker.failed.connect(self.on_chat_failed)
+        self.worker.finished.connect(self.on_worker_thread_finished)
         self.worker.start()
 
     def on_token(self, piece: str) -> None:
@@ -864,6 +865,9 @@ class MainWindow(QMainWindow):
         self.edit_button.setEnabled(True)
         self.more_button.setEnabled(True)
         self.input.setFocus()
+
+    def on_worker_thread_finished(self) -> None:
+        # Keep a strong reference to QThread until run() has actually returned.
         self.worker = None
 
     def closeEvent(self, event) -> None:
