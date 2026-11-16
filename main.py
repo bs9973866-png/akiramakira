@@ -520,10 +520,10 @@ class MainWindow(QMainWindow):
         self.edit_button = QPushButton("Настроить")
         self.edit_button.clicked.connect(self.edit_character)
         header_layout.addWidget(self.edit_button)
-        clear_button = QPushButton("Очистить чат")
-        clear_button.setObjectName("subtle")
-        clear_button.clicked.connect(self.clear_chat)
-        header_layout.addWidget(clear_button)
+        self.clear_chat_button = QPushButton("Очистить чат")
+        self.clear_chat_button.setObjectName("subtle")
+        self.clear_chat_button.clicked.connect(self.clear_chat)
+        header_layout.addWidget(self.clear_chat_button)
         main_layout.addWidget(header)
 
         self.scroll = QScrollArea()
@@ -615,12 +615,14 @@ class MainWindow(QMainWindow):
 
     def render_messages(self) -> None:
         self.clear_message_widgets()
+        self.welcome_widget = None
         char = self.current_character()
         if not self.messages:
             welcome = QLabel(f"Начни знакомство с персонажем «{char.get('name', 'Персонаж')}».\nНапиши первое сообщение — ответ появится здесь.")
             welcome.setAlignment(Qt.AlignmentFlag.AlignCenter)
             welcome.setWordWrap(True)
             welcome.setStyleSheet("color:#867b9b;font-size:15px;padding:40px;")
+            self.welcome_widget = welcome
             self.message_layout.addWidget(welcome)
         else:
             for message in self.messages:
@@ -633,6 +635,11 @@ class MainWindow(QMainWindow):
         bar.setValue(bar.maximum())
 
     def append_message(self, role: str, text: str) -> MessageBubble:
+        # Remove the empty-chat placeholder as soon as the first message arrives.
+        if self.welcome_widget is not None:
+            self.message_layout.removeWidget(self.welcome_widget)
+            self.welcome_widget.deleteLater()
+            self.welcome_widget = None
         # Keep the stretch at the bottom while inserting the newest message.
         stretch_index = max(0, self.message_layout.count() - 1)
         self.message_layout.insertWidget(stretch_index, MessageBubble(role, text, self.current_character()))
@@ -817,6 +824,7 @@ class MainWindow(QMainWindow):
         self.character_list.setEnabled(False)
         self.edit_button.setEnabled(False)
         self.more_button.setEnabled(False)
+        self.clear_chat_button.setEnabled(False)
         self.messages.append({"role": "user", "content": text})
         self.append_message("user", text)
         self.store.save_chat(self.current_character_id, self.messages)
@@ -864,6 +872,7 @@ class MainWindow(QMainWindow):
         self.character_list.setEnabled(True)
         self.edit_button.setEnabled(True)
         self.more_button.setEnabled(True)
+        self.clear_chat_button.setEnabled(True)
         self.input.setFocus()
 
     def on_worker_thread_finished(self) -> None:
